@@ -5,11 +5,15 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+import hashlib
+import json
 import os
+import secrets
 from pathlib import Path
+from typing import Optional
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -18,6 +22,25 @@ app = FastAPI(title="Mergington High School API",
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+# Load teacher credentials from teachers.json
+teachers_file = current_dir / "teachers.json"
+with open(teachers_file) as f:
+    teachers = json.load(f)
+
+# In-memory session store: token -> username
+active_sessions: dict[str, str] = {}
+
+
+def verify_teacher(authorization: Optional[str] = Header(default=None)) -> str:
+    """Dependency that validates a Bearer token and returns the teacher username."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    token = authorization.removeprefix("Bearer ")
+    username = active_sessions.get(token)
+    if not username:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    return username
 
 # In-memory activity database
 activities = {
@@ -83,14 +106,40 @@ def root():
     return RedirectResponse(url="/static/index.html")
 
 
+@app.post("/login")
+def login(username: str, password: str):
+    """Authenticate a teacher and return a session token."""
+    teacher = teachers.get(username)
+    if not teacher:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    expected = hashlib.pbkdf2_hmac(
+        "sha256", password.encode(), teacher["salt"].encode(), 260000
+    ).hex()
+    if not secrets.compare_digest(expected, teacher["hash"]):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    token = secrets.token_hex(32)
+    active_sessions[token] = username
+    return {"token": token, "username": username}
+
+
+@app.post("/logout")
+def logout(authorization: Optional[str] = Header(default=None)):
+    """Invalidate the current session token."""
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.removeprefix("Bearer ")
+        active_sessions.pop(token, None)
+    return {"message": "Logged out successfully"}
+
+
 @app.get("/activities")
 def get_activities():
     return activities
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
-    """Sign up a student for an activity"""
+def signup_for_activity(activity_name: str, email: str, authorization: Optional[str] = Header(default=None)):
+    """Sign up a student for an activity (requires teacher login)"""
+    verify_teacher(authorization)
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -111,8 +160,9 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
-    """Unregister a student from an activity"""
+def unregister_from_activity(activity_name: str, email: str, authorization: Optional[str] = Header(default=None)):
+    """Unregister a student from an activity (requires teacher login)"""
+    verify_teacher(authorization)
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
